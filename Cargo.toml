@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "common",
+  "server",
+  "client"
+]
+
+[profile.release]
+debug = true
+overflow-checks = true
