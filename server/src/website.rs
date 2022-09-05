@@ -22,8 +22,8 @@ use hyper::http::uri;
 use thebestofcmu_common::PostPath;
 
 pub struct Website {
-    pub kayaking_image: &'static [u8],
-    pub client: &'static [u8]
+    pub favicon: &'static [u8],
+    pub kayaking_image: &'static [u8]
 }
 
 fn request_path(request_uri: &uri::Parts) -> &str {
@@ -45,8 +45,8 @@ impl Website {
         let request_path = request_path(&request_uri);
         Some(match request_path {
             "/" => Body::from(main_page_content()),
+            "/favicon.ico" => Body::from(self.favicon),
             "/kayaking-background.webp" => Body::from(self.kayaking_image),
-            "/thebestofcmu-client.wasm" => Body::from(self.client),
             _ => return None
         })
     }
@@ -55,26 +55,21 @@ impl Website {
 
 fn main_page_content() -> &'static str {
     r#"
+<!DOCTYPE html>
+<head></head>
+<body>
 <h1 style="color: #5e9ca0; text-align: center;">Welcome, to the First Day of Class</h1>
 <p style="text-align: center;">You are hereby invited to come kayaking on the pristine waters of River Allegheny. The river, located far off to the north, beyond city limits, is a faraway place of wonder where a CMU student is a rare sight to behold. In a valley rimmed with vibrant treetops, exotic birds fly to and fro while fish dance in the water. Unlike the tumult of academic life, all elements of this valley cohere and are at harmony with one another. The river waters the plants, whose roots in turn hold the earthwork, preventing erosion; while the tree leaves provide shadow to the water and shelter to all that lives within.</p>
 <p style="text-align: center;">Yet there can be no serenity without danger, for the river is swift and merciless. From the depths of the current swell monstrous rocks and boulders, creating a continuous challenge of navigation for the few voyagers who chance this way. Those fortunate enough to survive, tell tall tales of adventure.</p>
 <p style="text-align: center;">This website is for fun: entirely theatrical. The location, exaggerated. All the same, kayaking is an enjoyable activity, whether you prefer strenous exertion or relaxing vacation. This school year, surely, will be a spectacular one.</p>
-<table style="border-collapse: collapse; width: 100%;" border="1">
-<tbody>
-<tr>
-<td style="width: 100%; text-align: center;">Event Details</td>
-</tr>
-<tr>
-<td style="width: 100%;">
-<p><strong>Time and Place: </strong>Meet at&nbsp;12:15 PM, <em><strong>sharp,</strong></em> at Fifth &amp; Craig intersection (St. Paul's Cathedral)</p>
-</td>
-</tr>
-<tr>
-<td style="width: 100%;"><strong>Cost:</strong> $40, cash only</td>
-</tr>
-</tbody>
-</table>
-<p style="text-align: left;">To RSVP, please reply by SMS to the coordinator who linked you to this website.</p>
+<ul>
+<li style="text-align: left;"><strong>Date:</strong> 3 September 2022</li>
+<li style="text-align: left;"><strong>Time and Place:</strong> Meet at&nbsp;12:15 PM, <em><strong>sharp,</strong></em> at Fifth &amp; Craig intersection (St. Paul's Cathedral)</li>
+<li style="text-align: left;"><strong>Cost:</strong> $40, cash only</li>
+</ul>
+<p style="text-align: left;">To RSVP, please reply by SMS to the coordinator who linked you to this website. If you want to invite anyone else, please ask the coordinator.</p>
+<p style="text-align: center;">&nbsp;</p>
+<p><img style="display: block; margin-left: auto; margin-right: auto;" src="./kayaking-background.webp" alt="kayaking-image" width="1200" height="795" /></p>
 <div id="spinner" style="position: relative;">
   <div class="spinner">Loading...</div>
 </div>
@@ -84,6 +79,9 @@ fn main_page_content() -> &'static str {
     document.getElementById("spinner").remove();
   });
 </script>
+<p style="text-align: right;">Source code available upon written request.</p>
+</body>
+</html>
     "#
 }
 
@@ -95,7 +93,7 @@ mod tests {
 
     #[test]
     fn post_path() -> Result<()> {
-        let website = Website { kayaking_image: &[], client: &[] };
+        let website = Website { favicon: &[], kayaking_image: &[] };
         let uri = Uri::builder()
             .path_and_query(PathAndQuery::from_static("/enter-rsvp"))
             .build()?;

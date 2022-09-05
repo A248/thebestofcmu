@@ -31,8 +31,9 @@ use serde::{Serialize, Deserialize};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Config {
     pub postgres_url: String,
+    pub host: String,
     pub port: u16,
-    pub enable_tls: bool,
+    pub tls: Tls,
     pub log_level: String
 }
 
@@ -40,11 +41,19 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             postgres_url: String::new(),
+            host: String::from("localhost"),
             port: 8080,
-            enable_tls: false,
+            tls: Default::default(),
             log_level: String::from("DEBUG")
         }
     }
+}
+
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Tls {
+    pub enable: bool,
+    pub client_auth: bool
 }
 
 impl Config {
@@ -112,7 +121,7 @@ mod tests {
         let config = Config {
             postgres_url: String::from("my-url"),
             port: 8080,
-            enable_tls: true,
+            tls: Default::default(),
             log_level: String::from("DEBUG")
         };
         config.clone().write_to(&path).await?;

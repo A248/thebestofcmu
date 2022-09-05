@@ -17,16 +17,16 @@
  * and navigate to version 3 of the GNU Affero General Public License.
  */
 
-use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use async_std::sync::Arc;
 use async_std::net::TcpListener;
 use eyre::Result;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use hyper::body::HttpBody;
 use hyper::http::{request, version};
 use hyper::service::{make_service_fn, service_fn};
+use rustls::ServerConfig;
 use thebestofcmu_common::{ClientRSVP, PostPath};
 use crate::database::Database;
 use crate::method::AllowedMethod;
@@ -37,36 +37,42 @@ pub struct App {
     pub website: Website
 }
 
+macro_rules! start_server_using {
+    ($app:expr, $shutdown_future:expr, $listener:expr) => {
+        Server::builder($listener)
+            .executor(compat::HyperExecutor)
+            .serve(make_service_fn(move |_| {
+                let app = $app.clone();
+                async {
+                    Ok::<_, eyre::Report>(service_fn(move |request: Request<Body>| {
+                        let app = app.clone();
+                        async move { (&app).handle_request(request).await }
+                    }))
+                }
+            }))
+            .with_graceful_shutdown($shutdown_future)
+            .await
+    }
+}
+
 impl App {
     pub async fn start_server<F>(self,
-                                        socket: SocketAddr,
-                                        shutdown_future: F) -> Result<()>
+                                 socket: SocketAddr,
+                                 tls: Option<Arc<ServerConfig>>,
+                                 shutdown_future: F) -> Result<()>
         where F: Future<Output=()> {
 
         let app = Arc::new(self);
-        let service_function = make_service_fn(move |_| {
-            let app = app.clone();
-            async {
-                Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
-                    let app = app.clone();
-                    async move { (&app).handle_request(request).await }
-                }))
-            }
-        });
-        //let listener = TcpListener::bind(&socket).await?;
-        log::info!("Bound to socket");
-        /*let server = Server::builder(compat::HyperListener(listener))
-            .executor(compat::HyperExecutor)
-            .serve(service_function);*/
-        tokio::runtime::
-        tokio::spawn(async move {
-            Server::try_bind(&socket)?
-                .serve(service_function)
-                .await?;
-            Ok::<(), eyre::Report>(())
-        });
-        Ok::<(), eyre::Report>(())
-        //Ok(server.with_graceful_shutdown(shutdown_future).await?)
+
+        let listener = TcpListener::bind(&socket).await?;
+        let listener = compat::HyperListener::new(&listener);
+        log::info!("Bound to socket {}", socket);
+
+        Ok(if let Some(tls) = tls {
+            start_server_using!(app, shutdown_future, tls::TlsAcceptor::new(tls, listener))
+        } else {
+            start_server_using!(app, shutdown_future, listener)
+        }?)
     }
 
     async fn handle_request(&self, request: Request<Body>) -> Result<Response<Body>> {
@@ -172,12 +178,11 @@ impl App {
 mod compat {
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use async_compat::CompatExt;
-
     use async_std::io;
-    use async_std::net::{TcpListener, TcpStream};
+    use async_std::net::{self, TcpListener, TcpStream};
     use async_std::prelude::*;
     use async_std::task;
+    use hyper::server::accept::Accept;
 
     #[derive(Clone)]
     pub struct HyperExecutor;
@@ -192,19 +197,179 @@ mod compat {
         }
     }
 
-    pub struct HyperListener(pub TcpListener);
+    pub struct HyperListener<'listener> {
+        incoming: net::Incoming<'listener>,
+    }
 
-    impl hyper::server::accept::Accept for HyperListener {
-        type Conn = async_compat::Compat<TcpStream>;
+    impl<'listener> HyperListener<'listener> {
+        pub fn new(listener: &'listener TcpListener) -> Self {
+            Self {
+                incoming: listener.incoming(),
+            }
+        }
+    }
+
+    impl Accept for HyperListener<'_> {
+        type Conn = HyperStream;
         type Error = io::Error;
 
         fn poll_accept(
-            self: Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             cx: &mut Context,
         ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
-            let stream = task::ready!(Pin::new(&mut self.0.incoming()).poll_next(cx)).unwrap()?;
-            Poll::Ready(Some(Ok(stream.compat())))
+            let stream = task::ready!(Pin::new(&mut self.incoming).poll_next(cx)).unwrap()?;
+            Poll::Ready(Some(Ok(HyperStream(stream))))
+        }
+    }
+
+    pub struct HyperStream(TcpStream);
+
+    impl tokio::io::AsyncRead for HyperStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let bytes =
+                task::ready!(Pin::new(&mut self.0).poll_read(cx, buf.initialize_unfilled())?);
+            buf.advance(bytes);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for HyperStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_close(cx)
         }
     }
 }
 
+mod tls {
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use async_std::sync::Arc;
+    use std::task::{Context, Poll};
+    use async_std::task::ready;
+    use hyper::server::accept::Accept;
+    use rustls::ServerConfig;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use crate::app::compat::{HyperListener, HyperStream};
+
+    enum State {
+        Handshaking(tokio_rustls::Accept<HyperStream>),
+        Streaming(tokio_rustls::server::TlsStream<HyperStream>),
+    }
+
+    // tokio_rustls::server::TlsStream doesn't expose constructor methods,
+    // so we have to TlsAcceptor::accept and handshake to have access to it
+    // TlsStream implements AsyncRead/AsyncWrite handshaking tokio_rustls::Accept first
+    pub struct TlsStream {
+        state: State,
+    }
+
+    impl TlsStream {
+        fn new(stream: HyperStream, config: Arc<ServerConfig>) -> TlsStream {
+            let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
+            TlsStream {
+                state: State::Handshaking(accept),
+            }
+        }
+    }
+
+    impl AsyncRead for TlsStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &mut ReadBuf,
+        ) -> Poll<io::Result<()>> {
+            let pin = self.get_mut();
+            match pin.state {
+                State::Handshaking(ref mut accept) => match ready!(Pin::new(accept).poll(cx)) {
+                    Ok(mut stream) => {
+                        let result = Pin::new(&mut stream).poll_read(cx, buf);
+                        pin.state = State::Streaming(stream);
+                        result
+                    }
+                    Err(err) => Poll::Ready(Err(err)),
+                },
+                State::Streaming(ref mut stream) => Pin::new(stream).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl AsyncWrite for TlsStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let pin = self.get_mut();
+            match pin.state {
+                State::Handshaking(ref mut accept) => match ready!(Pin::new(accept).poll(cx)) {
+                    Ok(mut stream) => {
+                        let result = Pin::new(&mut stream).poll_write(cx, buf);
+                        pin.state = State::Streaming(stream);
+                        result
+                    }
+                    Err(err) => Poll::Ready(Err(err)),
+                },
+                State::Streaming(ref mut stream) => Pin::new(stream).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.state {
+                State::Handshaking(_) => Poll::Ready(Ok(())),
+                State::Streaming(ref mut stream) => Pin::new(stream).poll_flush(cx),
+            }
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.state {
+                State::Handshaking(_) => Poll::Ready(Ok(())),
+                State::Streaming(ref mut stream) => Pin::new(stream).poll_shutdown(cx),
+            }
+        }
+    }
+
+    pub struct TlsAcceptor<'l> {
+        config: Arc<ServerConfig>,
+        listener: HyperListener<'l>,
+    }
+
+    impl<'l> TlsAcceptor<'l> {
+        pub fn new(config: Arc<ServerConfig>, listener: HyperListener<'l>) -> Self {
+            Self { config, listener }
+        }
+    }
+
+    impl<'l> Accept for TlsAcceptor<'l> {
+        type Conn = TlsStream;
+        type Error = io::Error;
+
+        fn poll_accept(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+            let pin = self.get_mut();
+            match ready!(Pin::new(&mut pin.listener).poll_accept(cx)) {
+                Some(Ok(stream)) => Poll::Ready(Some(Ok(TlsStream::new(stream, pin.config.clone())))),
+                Some(Err(e)) => Poll::Ready(Some(Err(e))),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+}

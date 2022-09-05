@@ -22,10 +22,14 @@
 
 extern crate core;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use async_ctrlc::CtrlC;
-use async_std::{fs, io, task};
+use async_std::{fs, io, sync, task};
+use async_std::path::Path;
+use async_std::prelude::FutureExt;
 use eyre::Result;
+use rustls::RootCertStore;
+use rustls::server::{AllowAnyAuthenticatedClient, NoClientAuth};
 use crate::app::App;
 use crate::cli::Cli;
 use crate::database::Database;
@@ -52,26 +56,44 @@ fn main() -> core::result::Result<(), eyre::Error> {
 
 async fn async_main() -> Result<()> {
     fs::create_dir_all("config").await?;
-    let config = config::Config::load("config.ron").await?;
+
+    let config = config::Config::load("config/config.ron").await?;
 
     simple_logging::log_to_stderr(config.log_level());
 
-    /*
-    let tls = if config.enable_tls {
-        let public_key = load_certificates("config/certificate.pem").await?;
-        let private_key = load_private_key("config/certificate.rsa").await?;
+    let tls = config.tls;
+    let tls = if tls.enable {
+        let server_certs = FutureExt::try_join(
+            load_certificates("config/server-certificate.pem"),
+            load_private_key("config/server-certificate.key")
+        );
+        let client_auth = async {
+            Ok(if tls.client_auth {
+                let client_certs = load_certificates("config/client-certificate.pem").await?;
+                let mut cert_store = RootCertStore::empty();
+                for client_cert in client_certs {
+                    cert_store.add(&client_cert)?;
+                }
+                AllowAnyAuthenticatedClient::new(cert_store)
+            } else {
+                NoClientAuth::new()
+            })
+        };
+        let ((public_key, private_key), client_auth) = server_certs
+            .try_join(client_auth)
+            .await?;
 
         let mut cfg = rustls::ServerConfig::builder()
             .with_safe_defaults()
-            .with_no_client_auth()
+            .with_client_cert_verifier(client_auth)
             .with_single_cert(public_key, private_key)?;
         // Configure ALPN to accept HTTP/2, HTTP/1.1 in that order.
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        async_std::sync::Arc::new(cfg)
+        Some(sync::Arc::new(cfg))
     } else {
-        todo!()
+        None
     };
-    */
+
     let database = Database {
         pool: sqlx::postgres::PgPool::connect_lazy(&config.postgres_url)?
     };
@@ -89,13 +111,13 @@ async fn async_main() -> Result<()> {
     let app = App {
         database,
         website: Website {
-            kayaking_image: include_bytes!("kayaking-background.webp"),
-            client: include_bytes!("../../target/debug/libthebestofcmu_client.so")
+            favicon: include_bytes!("icons8-fantasy-32.png"),
+            kayaking_image: include_bytes!("kayaking-background.webp")
         }
     };
     app.database.create_schema().await?;
-    let socket =  SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
-    app.start_server(socket, shutdown_signal()).await
+    let socket =  SocketAddr::new(config.host.parse()?, config.port);
+    app.start_server(socket, tls, shutdown_signal()).await
 }
 
 async fn shutdown_signal() {
@@ -103,7 +125,6 @@ async fn shutdown_signal() {
     log::info!("Shutting down....");
 }
 
-/*
 async fn load_certificates(path: impl AsRef<Path>) -> Result<Vec<rustls::Certificate>> {
     let certificate = fs::read_to_string(path).await?;
     let mut cert_reader = std::io::Cursor::new(certificate);
@@ -116,17 +137,17 @@ async fn load_certificates(path: impl AsRef<Path>) -> Result<Vec<rustls::Certifi
 async fn load_private_key(path: impl AsRef<Path>) -> Result<rustls::PrivateKey> {
     let private_key = fs::read_to_string(path).await?;
     let mut private_key_reader = std::io::Cursor::new(private_key);
-    let mut keys = rustls_pemfile::rsa_private_keys(&mut private_key_reader)?.into_iter();
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut private_key_reader)?.into_iter();
 
     return if let Some(private_key) = keys.next() {
         if let Some(_) = keys.next() {
             Err(eyre::eyre!("Too many keys"))
         } else {
-            Ok(PrivateKey(private_key))
+            Ok(rustls::PrivateKey(private_key))
         }
     } else {
         Err(eyre::eyre!("No private keys found"))
     }
 }
-*/
+
 
