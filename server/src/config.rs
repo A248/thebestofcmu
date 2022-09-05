@@ -18,11 +18,7 @@
  */
 
 use std::str::FromStr;
-use async_std::io::BufWriter;
 use async_std::fs;
-use async_std::fs::OpenOptions;
-use async_std::io::WriteExt;
-use async_std::path::Path;
 use eyre::Result;
 use log::LevelFilter;
 use ron::ser::PrettyConfig;
@@ -65,68 +61,56 @@ impl Config {
         })
     }
 
-    pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        Ok(if path.exists().await {
-            let file_content = fs::read_to_string(path).await?;
-            ron::from_str(&file_content)?
-        } else {
+    pub async fn load(file: &ConfigFile<'_>) -> Result<Self> {
+        let config = file.read_content_with_default(|| {
             let default_conf = Self::default();
-            default_conf.clone().write_to(path).await?;
-            default_conf
-        })
+            Ok(ron::ser::to_string_pretty(&default_conf, PrettyConfig::default())?)
+        }).await?;
+        Ok(ron::from_str(&config)?)
     }
 
-    pub async fn write_to(self, path: &Path) -> Result<()> {
-        // Write default config
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path).await?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(
-            ron::ser::to_string_pretty(&self, PrettyConfig::default())?.as_bytes()
-        ).await?;
-        writer.flush().await?;
-        Ok(())
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use async_std::path::PathBuf;
-    use tempfile::TempDir;
-    use super::*;
+pub struct ConfigFile<'c> {
+    path: &'c str,
+    env_var: &'c str
+}
 
-    fn temp_file_in(tempdir: &TempDir, filename: &str) -> PathBuf {
-        let mut path = PathBuf::from(tempdir.path().as_os_str().to_os_string());
-        path.push(filename);
-        path
+impl<'c> ConfigFile<'c> {
+    pub fn new(path: &'c str, env_var: &'c str) -> Self {
+        Self { path, env_var }
     }
 
-    #[async_std::test]
-    async fn write_default_config() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let path = temp_file_in(&tempdir, "config.ron");
-
-        Config::default().write_to(&path).await?;
-        Ok(())
+    pub async fn read_content(&self) -> Result<String> {
+        fn non_existent() -> Result<String> {
+            Err(eyre::eyre!("Should never be called"))
+        }
+        self.read_content_impl(false, non_existent).await
     }
 
-    #[async_std::test]
-    async fn reload_config() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let path = temp_file_in(&tempdir, "config.ron");
+    pub async fn read_content_with_default<D>(&self, default: D) -> Result<String>
+        where D: FnOnce() -> Result<String> {
 
-        let config = Config {
-            postgres_url: String::from("my-url"),
-            port: 8080,
-            tls: Default::default(),
-            log_level: String::from("DEBUG")
-        };
-        config.clone().write_to(&path).await?;
-        let reloaded = Config::load(&path).await.expect("Config ought to exist");
-        assert_eq!(config, reloaded);
-        Ok(())
+        self.read_content_impl(true, default).await
+    }
+
+    async fn read_content_impl<D>(&self, use_default: bool, default: D) -> Result<String>
+        where D: FnOnce() -> Result<String> {
+
+        Ok(if let Some(environment_value) = std::env::var_os(self.env_var) {
+            match environment_value.to_str() {
+                Some(result) => result.to_string(),
+                None => return Err(eyre::eyre!("Not valid UTF-8: {:?}", environment_value))
+            }
+        } else {
+            let path = self.path;
+            if use_default {
+                let default_content = default()?;
+                fs::write(path, &default_content).await?;
+                default_content
+            } else {
+                fs::read_to_string(path).await?
+            }
+        })
     }
 }

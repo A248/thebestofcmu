@@ -25,13 +25,13 @@ extern crate core;
 use std::net::SocketAddr;
 use async_ctrlc::CtrlC;
 use async_std::{fs, io, sync, task};
-use async_std::path::Path;
 use async_std::prelude::FutureExt;
 use eyre::Result;
 use rustls::RootCertStore;
 use rustls::server::{AllowAnyAuthenticatedClient, NoClientAuth};
 use crate::app::App;
 use crate::cli::Cli;
+use crate::config::ConfigFile;
 use crate::database::Database;
 use crate::website::Website;
 
@@ -57,19 +57,23 @@ fn main() -> core::result::Result<(), eyre::Error> {
 async fn async_main() -> Result<()> {
     fs::create_dir_all("config").await?;
 
-    let config = config::Config::load("config/config.ron").await?;
+    let config = config::Config::load(&ConfigFile::new("config/config.ron", "CONFIG_RON")).await?;
 
     simple_logging::log_to_stderr(config.log_level());
 
     let tls = config.tls;
     let tls = if tls.enable {
+
+        let server_cert_file = ConfigFile::new("config/server-certificate.pem", "SERVER_CERTIFICATE");
+        let server_key_file = ConfigFile::new("config/server-certificate.key", "SERVER_KEY");
+        let client_cert_file = ConfigFile::new("config/client-certificate.pem", "CLIENT_CERTIFICATE");
+
         let server_certs = FutureExt::try_join(
-            load_certificates("config/server-certificate.pem"),
-            load_private_key("config/server-certificate.key")
+            load_certificates(&server_cert_file), load_private_key(&server_key_file)
         );
         let client_auth = async {
             Ok(if tls.client_auth {
-                let client_certs = load_certificates("config/client-certificate.pem").await?;
+                let client_certs = load_certificates(&client_cert_file).await?;
                 let mut cert_store = RootCertStore::empty();
                 for client_cert in client_certs {
                     cert_store.add(&client_cert)?;
@@ -125,8 +129,8 @@ async fn shutdown_signal() {
     log::info!("Shutting down....");
 }
 
-async fn load_certificates(path: impl AsRef<Path>) -> Result<Vec<rustls::Certificate>> {
-    let certificate = fs::read_to_string(path).await?;
+async fn load_certificates(path: &ConfigFile<'_>) -> Result<Vec<rustls::Certificate>> {
+    let certificate = path.read_content().await?;
     let mut cert_reader = std::io::Cursor::new(certificate);
     Ok(rustls_pemfile::certs(&mut cert_reader)?
         .into_iter()
@@ -134,8 +138,8 @@ async fn load_certificates(path: impl AsRef<Path>) -> Result<Vec<rustls::Certifi
         .collect())
 }
 
-async fn load_private_key(path: impl AsRef<Path>) -> Result<rustls::PrivateKey> {
-    let private_key = fs::read_to_string(path).await?;
+async fn load_private_key(path: &ConfigFile<'_>) -> Result<rustls::PrivateKey> {
+    let private_key = path.read_content().await?;
     let mut private_key_reader = std::io::Cursor::new(private_key);
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut private_key_reader)?.into_iter();
 
